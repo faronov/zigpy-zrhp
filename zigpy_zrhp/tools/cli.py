@@ -295,6 +295,25 @@ async def cmd_listen(api: ZrhpApi, args) -> None:
     await _listen(api, args.seconds)
 
 
+async def cmd_leave(api: ZrhpApi, args) -> None:
+    """ZDO Mgmt_Leave_req to a device through the NCP (it may rejoin later)."""
+    from ..ocb import ieee_wire
+
+    ieee = ieee_wire(args.ieee)
+    asdu = bytes([0x5A]) + ieee + bytes([0x80 if args.rejoin else 0x00])
+    req = m.ApsDataRequest(
+        dst_mode=m.AddrMode.NWK,
+        dst=args.nwk,
+        profile=0,
+        cluster=0x0034,
+        tx_options=0x01 | 0x20,  # APS ACK, extended timeout (sleepy device)
+        asdu=asdu,
+    )
+    await api.request(req)
+    print(f"Mgmt_Leave_req (rejoin={args.rejoin}) queued for 0x{args.nwk:04X}")
+    await _listen(api, args.seconds)
+
+
 async def cmd_reset(api: ZrhpApi, args) -> None:
     if args.hard:
         await api.hard_reset()
@@ -481,6 +500,11 @@ def build_parser() -> argparse.ArgumentParser:
     li = sub.add_parser("listen")
     li.add_argument("--seconds", type=float, default=30)
     li.add_argument("--log-level", type=int, default=None)
+    lv = sub.add_parser("leave", help="ask a device to leave (ZDO Mgmt_Leave_req)")
+    lv.add_argument("nwk", type=lambda s: int(s, 0))
+    lv.add_argument("ieee", help="big-endian hex, e.g. 6055f9fffef69688")
+    lv.add_argument("--rejoin", action="store_true")
+    lv.add_argument("--seconds", type=float, default=30)
     rs = sub.add_parser("reset")
     rs.add_argument("--mode", choices=("reboot", "bootloader", "factory"), default="reboot")
     rs.add_argument("--hard", action="store_true", help="DTR/RTS reset instead of SYS_RESET")
@@ -528,6 +552,7 @@ def main(argv: list[str] | None = None) -> None:
         "init": cmd_init,
         "permit": cmd_permit,
         "listen": cmd_listen,
+        "leave": cmd_leave,
         "reset": cmd_reset,
         "lock-key-export": cmd_lock,
         "gp-sink-table": cmd_gp,
