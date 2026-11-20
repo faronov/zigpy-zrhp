@@ -85,6 +85,7 @@ LOGGER = logging.getLogger(__name__)
 
 #: ``BKP_EXPORT_READ`` chunk.
 EXPORT_CHUNK = 600
+CHANNEL_CHANGE_TIMEOUT = 20.0  # 9 s broadcast delivery time + margin
 #: ``BKP_RESTORE_PUT`` payload budget (633 B message minus txn).
 PUT_BUDGET = 600
 APS_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
@@ -136,6 +137,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # one restore at a time.
         self._backup_lock = asyncio.Lock()
         self._scan_waiters: dict[int, asyncio.Future] = {}
+        self._channel_waiters: dict[int, asyncio.Future] = {}
         self.manufacturer_code = zc[CONF_MANUFACTURER_CODE] or 0x0000
         self._baudrate = self._config[zigpy.config.CONF_DEVICE][CONF_DEVICE_BAUDRATE]
         self._flow = self._config[zigpy.config.CONF_DEVICE][CONF_DEVICE_FLOW_CONTROL]
@@ -412,6 +414,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     async def permit_with_link_key(
         self, node: t.EUI64, link_key: t.KeyData, time_s: int = 60
     ) -> None:
+        """Provision a unique TCLK (``SEC_ADD_LINK_KEY`` type 1), then permit."""
         await self.api.request(
             m.SecAddLinkKeyReq(
                 ieee=node.serialize(),
@@ -422,7 +425,38 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 flags=0x01,
             )
         )
+        await self._store_provisioned_key(node, link_key.serialize(), KeyOrigin.IMPORTED)
         await self.permit(time_s)
+
+    async def permit_with_key(self, node: t.EUI64, code: bytes, time_s: int = 60) -> None:
+        """Install code: the NCP checks the CRC and derives the key (7.4)."""
+        try:
+            _, rsp = await self.api.request(
+                m.SecAddInstallCodeReq(ieee=node.serialize(), code=bytes(code))
+            )
+        except ZrhpError as e:
+            if e.status == Status.UNSUPPORTED_COMMAND:
+                await super().permit_with_key(node, code, time_s)
+                return
+            if e.status == Status.INVALID_PARAMETER:
+                raise ValueError(f"Invalid install code: {bytes(code).hex()}") from e
+            raise
+        await self._store_provisioned_key(node, rsp.derived_key, KeyOrigin.INSTALL_CODE)
+        await self.permit(time_s)
+
+    async def _store_provisioned_key(self, node: t.EUI64, key: bytes, origin: int) -> None:
+        """The host keeps provisioned keys (section 8) for backups and paging."""
+        if self._store is not None:
+            await self._store.upsert_link_keys(
+                [
+                    LinkKeyRow(
+                        ieee=node.serialize(),
+                        key=bytes(key),
+                        attrs=KeyAttrs.PROVISIONAL,
+                        origin=origin,
+                    )
+                ]
+            )
 
     async def energy_scan(
         self, channels: t.Channels, duration_exp: int, count: int
@@ -455,9 +489,36 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         return {r.channel: r.energy for r in evt.results}
 
     async def _move_network_to_channel(self, new_channel: int, new_nwk_update_id: int) -> None:
-        await self.api.request(
-            m.NwkChangeChannelReq(channel=new_channel, nwk_update_id=new_nwk_update_id)
-        )
+        """``NWK_CHANGE_CHANNEL``: the NCP broadcasts, commits and tunes about
+        9 s later (``nwkNetworkBroadcastDeliveryTime``), then
+        ``EVT_CHANNEL_CHANGED``; ``BUSY`` while another change is pending."""
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future = loop.create_future()
+
+        def on_sent(tid: int) -> None:
+            self._channel_waiters[tid] = done
+
+        try:
+            raw = await self.api.request_raw(
+                m.Id.NWK_CHANGE_CHANNEL,
+                m.NwkChangeChannelReq(
+                    channel=new_channel, nwk_update_id=new_nwk_update_id
+                ).serialize(),
+                on_sent=on_sent,
+                timeout=CHANNEL_CHANGE_TIMEOUT,
+            )
+            if raw[0] != Status.SUCCESS:
+                raise ZrhpError(m.Id.NWK_CHANGE_CHANNEL, Status.from_int(raw[0]))
+            async with asyncio.timeout(CHANNEL_CHANGE_TIMEOUT):
+                evt = await done
+        finally:
+            for k, v in list(self._channel_waiters.items()):
+                if v is done:
+                    del self._channel_waiters[k]
+        if evt.channel != new_channel:
+            raise zigpy.exceptions.ControllerException(
+                f"NCP stayed on channel {evt.channel} (radio tune failed)"
+            )
 
     async def _set_tx_power(self, tx_power: float) -> float | None:
         self._tx_power = tx_power
@@ -535,7 +596,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         try:
             while True:
                 status, rsp = await self.api.request(
-                    m.BkpExportReadReq(txn=begin.txn, max_bytes=EXPORT_CHUNK), timeout=10
+                    m.BkpExportReadReq(txn=begin.txn, max_bytes=self._export_chunk()), timeout=10
                 )
                 stream += rsp.records
                 if not rsp.more:
@@ -544,6 +605,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             with contextlib.suppress(ZrhpError):
                 await self.api.request(m.BkpExportEndReq(txn=begin.txn))
         return decode_records(bytes(stream))
+
+    def _export_chunk(self) -> int:
+        """``BKP_EXPORT_READ.max_bytes`` within the response budget (5.10)."""
+        return max(64, min(EXPORT_CHUNK, self.api.response_budget() - 16))
 
     async def load_network_info(self, *, load_devices: bool = False) -> None:
         info = await self._get_info()
@@ -695,11 +760,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             passthrough["stack_specific"].pop("ezsp", None)
         await self._store.set_meta(passthrough=passthrough)
 
-        info = await self._get_info()
-        if info.state == NetworkState.UP:
-            # The NCP restores only with the stack stopped; the wipe keeps the
-            # frame-counter bounds, the IEEE override and the endpoints.
-            await self.api.request(m.NwkLeaveResetReq(flags=0x03), timeout=15)
         await self._restore(records, nwk_margin=0, aps_margin=aps_margin, allow_ieee=ieee_change)
         self.state.network_info = network_info
         self.state.node_info = node_info
@@ -709,14 +769,22 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     ) -> Any:
         session = self.api.session
         max_per_put = session.capacity(Capacity.MAX_RESTORE_RECORDS_PER_PUT, 16) or 16
-        _, begin = await self.api.request(
-            m.BkpRestoreBeginReq(
-                flags=0x01 if allow_ieee else 0x00,
-                nwk_margin=nwk_margin,
-                aps_margin=aps_margin,
-                expected_records=len(records),
-            )
+        begin_req = m.BkpRestoreBeginReq(
+            flags=0x01 if allow_ieee else 0x00,
+            nwk_margin=nwk_margin,
+            aps_margin=aps_margin,
+            expected_records=len(records),
         )
+        # 9.4 rule 1: BEGIN is accepted with the network up (it keeps serving
+        # until COMMIT replaces it). Older NCP images answer INVALID_STATE;
+        # for them wipe first, keeping the frame-counter bounds, the IEEE
+        # override and the endpoints.
+        status, begin = await self.api.request(
+            begin_req, allow=(Status.SUCCESS, Status.INVALID_STATE)
+        )
+        if status == Status.INVALID_STATE:
+            await self.api.request(m.NwkLeaveResetReq(flags=0x03), timeout=15)
+            _, begin = await self.api.request(begin_req)
         try:
             tlvs = [encode_record(r) for r in records]
             chunk: list[bytes] = []
@@ -862,7 +930,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             tid_holder = tids
             try:
                 raw = await self.api.request_raw(
-                    m.Id.APS_DATA_REQUEST, payload, on_sent=on_sent, retry=True
+                    m.Id.APS_DATA_REQUEST, payload, on_sent=on_sent, retry=True, busy_retry=False
                 )
             except LinkResetError as e:
                 self._drop_confirm(tid_holder)
@@ -973,6 +1041,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             self.state.network_info = self.state.network_info.replace(
                 channel=body.channel, nwk_update_id=body.nwk_update_id
             )
+            fut = self._channel_waiters.pop(body.req_tid, None)
+            if fut is not None and not fut.done():
+                fut.set_result(body)
         elif mid == m.Id.EVT_PERMIT_JOIN_STATE:
             loop = asyncio.get_running_loop()
             self._permit_until = loop.time() + body.remaining_s if body.remaining_s else None
@@ -1145,12 +1216,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         epoch = await self._store.meta("table_epoch")
         if epoch is not None and ready.table_epoch != epoch:
             raise SessionLost(f"NCP table epoch changed ({epoch} -> {ready.table_epoch})")
-        if ready.network_state != NetworkState.UP:
-            # The NCP only reports the network parameters once NWK_INIT has
-            # brought the persisted network up (formed-down reads back as an
-            # unconfigured NIB), so start it before comparing.
-            await self._bring_up()
         net = await self._get_info()
+        if net.state != NetworkState.UP and not _identity_known(net):
+            # NCP images before Z11 report the network only once NWK_INIT has
+            # brought it up (formed-down reads back as an unset NIB).
+            await self._bring_up()
+            net = await self._get_info()
         ni = self.state.network_info
         node = self.state.node_info
         mismatch = [
@@ -1181,6 +1252,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 network_key=ni.network_key.replace(seq=net.key_seq),
             )
         _, self._info = await self.api.request(m.SysGetInfoReq())
+        if net.state != NetworkState.UP:
+            await self._bring_up()  # the stored identity matched (Z11)
         await self._apply_tc_policy()
         for desc in list(self.host_endpoints.values()):
             await self.add_endpoint(desc)
@@ -1220,6 +1293,11 @@ def _normalize(
         channel_mask=t.Channels(ni.channel_mask),
     )
     return ni, node
+
+
+def _identity_known(info: Any) -> bool:
+    """``NWK_GET_INFO`` carries the stored network (7.2, state 1 since Z11)."""
+    return info.pan_id != 0xFFFF and any(bytes(info.ext_pan_id))
 
 
 def _seq_ge(a: int, b: int) -> bool:

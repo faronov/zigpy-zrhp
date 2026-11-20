@@ -17,13 +17,13 @@ Home Assistant ZHA). Radio type: `zrhp`.
 
 | Area | What the library does |
 |---|---|
-| Transports | USB-Serial-JTAG (ESP32-H2/C6 native USB) and UART. UART defaults to 921 600 baud; if no session comes up it retries at 460 800 without flow control (the Thread BR board fallback). DTR/RTS are always changed together; a DTR/RTS hard reset is the last resume step. |
+| Transports | USB-Serial-JTAG (ESP32-H2/C6 native USB) and UART. UART defaults to 921 600 baud; a silent port is reopened, then reset by DTR/RTS, and only then retried at 460 800 without flow control (the Thread BR board fallback). DTR/RTS are always changed together; a DTR/RTS hard reset is the last resume step. |
 | Link layer | COBS + CRC-32C framing, selective-repeat ARQ with SACK and immediate NAK, per-endpoint ordering and credits, keepalive, session handshake with cookies and epoch. A line-by-line port of `zigbee_zrhp::link`, checked against `arq_scenarios.json`. |
-| Messages | Every v1 command, event and record (spec 7-9) with typed codecs. Many requests in flight; `RETRY` after a link resync (6.5). |
-| zigpy | `connect`, `start_network`, `load_network_info`, `write_network_info`, `reset_network_info`, `send_packet` (BUSY back-off, APS confirms, source routes, extended timeout), `packet_received`, `permit`, `permit_ncp`, `permit_with_link_key`, `energy_scan`, `add_endpoint`, `force_remove`, channel change, TX power, group membership, `_watchdog_feed` with counters. ZDO requests to the coordinator are answered on the host (no loopback). |
-| Seamless resume | An NCP reboot or a link loss is hidden from zigpy when the NCP state reconciles (IEEE, PAN ID, EPID, channel, update ID, key sequence, `table_epoch`): requests wait, then endpoints, groups, TC policy, GP sink, permit-join and GP windows and the key-export lock are replayed. `connection_lost` only when it cannot be reconciled. |
+| Messages | Every v1 command, event and record (spec 7-9) with typed codecs. Many requests in flight within a per-endpoint response budget (1 024 B, or the NCP's `host_response_bytes` capacity if smaller, 5.10); `BUSY` is retried with backoff on any request; `RETRY` after a link resync (6.5). |
+| zigpy | `connect`, `start_network`, `load_network_info`, `write_network_info`, `reset_network_info`, `send_packet` (BUSY back-off, APS confirms, source routes, extended timeout), `packet_received`, `permit`, `permit_ncp`, `permit_with_link_key` (`SEC_ADD_LINK_KEY`), `permit_with_key` (install code derived by the NCP, `SEC_ADD_INSTALL_CODE`; provisioned keys are kept in the host store), `energy_scan`, `add_endpoint`, `force_remove`, channel change (`NWK_CHANGE_CHANNEL`, waits for `EVT_CHANNEL_CHANGED`), TX power, group membership (including the GP endpoint 242), `_watchdog_feed` with counters. ZDO requests to the coordinator are answered on the host (no loopback); Mgmt_Lqi/Mgmt_Rtg come from `DIAG_GET_NEIGHBORS`/`DIAG_GET_ROUTES` (`NOT_SUPPORTED` on NCPs without them). |
+| Seamless resume | An NCP reboot or a link loss is hidden from zigpy when the NCP state reconciles (IEEE, PAN ID, EPID, channel, update ID, key sequence, `table_epoch`; compared before `NWK_INIT` when the NCP reports its stored network, after it on older images): requests wait, then endpoints, groups, TC policy, GP sink, permit-join and GP windows and the key-export lock are replayed. `connection_lost` only when it cannot be reconciled. |
 | Host store | Sidecar SQLite `zigbee_zrhp.db` next to `zigbee.db` (WAL, `synchronous=FULL`): link keys from `TBL_WRITEBACK`, `TBL_LOOKUP` answers, the frame-counter checkpoint log whose floors go into `NWK_INIT`, table epoch, GP shadow. Standalone mode is the default; paging is decided by the NCP. |
-| Backups | zigpy network backups map to Open Coordinator Backup records (`NODE`, `NETWORK`, keys, `DEVICE`, `RS_PARAMS`, GP tables) with `stack_specific.zigbee_rs`. Restores use `nwk_margin = 0`, `aps_margin = 10 000` (2^20 when the APS counter is unknown). EZSP hashed TCLK and other stacks' `stack_specific` keys pass through. Optional lock of key export after each backup. |
+| Backups | zigpy network backups map to Open Coordinator Backup records (`NODE`, `NETWORK`, keys, `DEVICE`, `RS_PARAMS`, GP tables) with `stack_specific.zigbee_rs`. Restores use `nwk_margin = 0`, `aps_margin = 10 000` (2^20 when the APS counter is unknown) and start with the network up (`COMMIT` replaces it; older images get `NWK_LEAVE_RESET` first). Exported `DEVICE` records follow the presence rule: a link block replaces the host's key, a record without one keeps it. EZSP hashed TCLK and other stacks' `stack_specific` keys pass through. Optional lock of key export after each backup. |
 | Green Power | The NCP sink is authoritative; zigpy is its shadow: `EVT_GP_FRAME` feeds `gp_packet_received`, zigpy's own sink transmissions are swallowed, unpair becomes `GP_SINK_REMOVE`, GPDs are reconciled with the NCP Sink Table at start and resume. Security level 0x00 (zigpy-compatible). |
 
 ### The Green Power hook
@@ -93,10 +93,10 @@ Tests:
 * `test_link.py`: link conformance and seeded noise (bit errors, drops,
   inserted `0x00`, duplicated chunks), HOL blocking, wrap, REJECT, resets.
 * `test_api.py`, `test_application.py`, `test_resume.py`, `test_backup.py`,
-  `test_gp.py`: the library against the Python NCP simulator
+  `test_gp.py`, `test_host_gaps.py`: the library against the Python NCP simulator
   (`zigpy_zrhp.sim`), with simulated devices that answer zigpy's interview.
-* `test_rust_ncp.py`: against the Rust NCP (`examples/ncp_sim.rs` on the
-  `zrhp-ncp-sim` branch of zigbee-rs) when `ZRHP_NCP_SIM` points to it.
+* `test_rust_ncp.py`: against the Rust NCP (`examples/ncp_sim.rs`, zigbee-rs
+  `ncp-host-gaps` or newer) when `ZRHP_NCP_SIM` points to it.
 
 ## License
 

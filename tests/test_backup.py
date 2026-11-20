@@ -85,17 +85,41 @@ async def test_backup_restore_to_another_ncp(tmp_path) -> None:
         await sim2.stop()
 
 
-async def test_restore_while_running_wipes_first(tmp_path) -> None:
+async def test_restore_while_running_commit_replaces(tmp_path) -> None:
+    """9.4 rule 1: BEGIN with the network up; COMMIT replaces it, no host wipe."""
     app, bench = await start_app(tmp_path)
+    sim = bench.sim
+    try:
+        backup = await app.backups.create_backup(load_devices=True)
+        nwk_before = sim.nwk_current
+        restores = sim.restores_while_up
+        n = len(sim.requests)
+        await app.backups.restore_backup(backup)
+        ids = [mid for mid, _ in sim.requests[n:]]
+        assert m.Id.NWK_LEAVE_RESET not in ids
+        assert m.Id.BKP_RESTORE_BEGIN in ids
+        assert sim.restores_while_up == restores + 1
+        assert sim.nwk_current >= nwk_before  # outgoing counters retained
+        assert app.backups.most_recent_backup().supersedes(backup)
+    finally:
+        await stop(app, bench)
+
+
+async def test_restore_while_running_wipes_first_on_legacy_ncp(tmp_path) -> None:
+    """Older images refuse BEGIN with the network up: wipe, then BEGIN again."""
+    app, bench = await start_app(tmp_path, Bench(SimNcp(legacy=True)))
     sim = bench.sim
     try:
         backup = await app.backups.create_backup(load_devices=True)
         n = len(sim.requests)
         await app.backups.restore_backup(backup)
         ids = [mid for mid, _ in sim.requests[n:]]
-        assert ids.index(m.Id.NWK_LEAVE_RESET) < ids.index(m.Id.BKP_RESTORE_BEGIN)
+        assert ids.index(m.Id.NWK_LEAVE_RESET) < len(ids) - 1 - ids[::-1].index(
+            m.Id.BKP_RESTORE_BEGIN
+        )
         leave = m.decode_message(sim.requests[n + ids.index(m.Id.NWK_LEAVE_RESET)][1])
         assert leave.flags == 0x03  # keep the IEEE override and the endpoints
+        assert sim.restores_while_up == 0
         assert app.backups.most_recent_backup().supersedes(backup)
     finally:
         await stop(app, bench)

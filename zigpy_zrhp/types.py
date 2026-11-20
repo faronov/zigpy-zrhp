@@ -144,6 +144,7 @@ class Capacity(enum.IntEnum):
     GP_PROXY_TABLE = 16
     MAX_NCP_REQUESTS = 17
     MAX_TC_DEVICES = 18
+    HOST_RESPONSE_BYTES = 19
 
 
 class NetworkState(enum.IntEnum):

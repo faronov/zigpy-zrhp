@@ -10,7 +10,9 @@ permissions:
 
 env:
   RUST_TOOLCHAIN: nightly-2026-03-23
-  ZIGBEE_RS_REF: zrhp-ncp-sim
+  # ncp-host-gaps (capacity 19, BUSY admission, DIAG tables, Z11, restore
+  # while up); move to master once it is merged.
+  ZIGBEE_RS_REF: 3062b77c3da016e877340445257266b480699955
 
 jobs:
   lint:

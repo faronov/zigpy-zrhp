@@ -45,10 +45,14 @@ HOST_CAPS = (
 )
 
 
-#: Response bytes the host lets the NCP owe per endpoint. The NCP queues its
-#: responses in a 1 536-byte buffer per endpoint (1 024 on compact parts) and
-#: drops what does not fit, so the host bounds what it has in flight.
+#: Response bytes the host lets the NCP owe per endpoint (5.10). The NCP
+#: advertises its own budget as capacity 19 (``host_response_bytes``); the
+#: smaller value applies. NCP images before that capacity dropped responses
+#: that did not fit their 1 536-byte queue, so this bound also protects them.
 RESPONSE_BUDGET = 1024
+#: ``BUSY`` (queue space, APS slots, a pending channel change) means the
+#: request was not executed: retry with exponential backoff.
+BUSY_BACKOFF_S = (0.01, 0.5)
 _DEFAULT_RESPONSE = 48
 
 
@@ -198,6 +202,7 @@ class ZrhpApi:
             "retries_after_resync": 0,
             "lost_after_restart": 0,
             "port_reopened": 0,
+            "busy_retries": 0,
         }
 
     # --- Registration -------------------------------------------------------
@@ -333,6 +338,7 @@ class ZrhpApi:
         allow: tuple[int, ...] = (Status.SUCCESS,),
         wait_session: float | None = 30.0,
         retry: bool = True,
+        busy_retry: bool = True,
     ) -> tuple[Status | int, Struct | None]:
         """Send a request and return ``(status, response body)``.
 
@@ -341,7 +347,12 @@ class ZrhpApi:
         msg_id = body.MSG_ID  # type: ignore[attr-defined]
         payload = body.serialize()
         rsp = await self.request_raw(
-            msg_id, payload, timeout=timeout, wait_session=wait_session, retry=retry
+            msg_id,
+            payload,
+            timeout=timeout,
+            wait_session=wait_session,
+            retry=retry,
+            busy_retry=busy_retry,
         )
         status, decoded = m.decode_response(msg_id, rsp)
         if status not in allow:
@@ -357,8 +368,13 @@ class ZrhpApi:
         wait_session: float | None = 30.0,
         retry: bool = True,
         on_sent: Callable[[int], None] | None = None,
+        busy_retry: bool = True,
     ) -> bytes:
-        """Send a raw request; returns the raw response payload (status first)."""
+        """Send a raw request; returns the raw response payload (status first).
+
+        ``BUSY`` is retried with backoff within ``timeout`` (``busy_retry``);
+        ``on_sent`` is called with the TID of every attempt.
+        """
         endpoint = m.home_endpoint(msg_id)
         if endpoint is None:
             raise ValueError(f"no home endpoint for 0x{msg_id:04X}")
@@ -369,7 +385,44 @@ class ZrhpApi:
                 raise SessionLost("not connected")
             await self.wait_ready(wait_session)
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        delay = BUSY_BACKOFF_S[0]
+        while True:
+            rsp = await self._request_once(
+                msg_id, payload, endpoint, timeout=timeout, retry=retry, on_sent=on_sent
+            )
+            if not busy_retry or not rsp or rsp[0] != Status.BUSY:
+                return rsp
+            remaining = deadline - loop.time()
+            if remaining <= delay:
+                return rsp  # the caller sees BUSY
+            self.counters["busy_retries"] += 1
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, BUSY_BACKOFF_S[1])
+            if not self._ready.is_set():
+                await self.wait_ready(wait_session)
+
+    def response_budget(self) -> int:
+        """Per-endpoint response budget: ours, capped by capacity 19 (5.10)."""
+        session = self.session
+        ncp = 0
+        if session is not None and getattr(session, "negotiate", None) is not None:
+            ncp = session.capacity(Capacity.HOST_RESPONSE_BYTES, 0)
+        return min(RESPONSE_BUDGET, ncp) if ncp else RESPONSE_BUDGET
+
+    async def _request_once(
+        self,
+        msg_id: int,
+        payload: bytes,
+        endpoint: Endpoint,
+        *,
+        timeout: float,
+        retry: bool,
+        on_sent: Callable[[int], None] | None,
+    ) -> bytes:
+        loop = asyncio.get_running_loop()
         budget = self._budgets.setdefault(endpoint, _Budget(RESPONSE_BUDGET))
+        budget.capacity = self.response_budget()
         try:
             async with asyncio.timeout(timeout):
                 weight = await budget.acquire(_expected_response(msg_id, payload))

@@ -24,6 +24,10 @@ LOGGER = logging.getLogger(__name__)
 
 NOT_SUPPORTED = zdo_t.Status.NOT_SUPPORTED
 
+#: ``DIAG_GET_NEIGHBORS.relationship`` → Mgmt_Lqi (R22 Table 2-127). zigpy's
+#: 3-bit enum has no "unauthenticated child" (5): report it as a child.
+_RELATIONSHIP = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 1}
+
 #: Coordinator node descriptor (2.4 GHz, mains, TC, receiver on).
 NODE_DESCRIPTOR = zdo_t.NodeDescriptor(
     logical_type=zdo_t.LogicalType.Coordinator,
@@ -139,6 +143,8 @@ class LocalZdo:
         return rsp if status == Status.SUCCESS else None
 
     async def _Mgmt_Lqi_req(self, tsn, start):
+        """The coordinator's neighbour table from ``DIAG_GET_NEIGHBORS`` (pages
+        of up to 16; zigpy asks again from ``start + len(entries)``)."""
         rsp = await self._diag(m.DiagGetNeighborsReq(start=start))
         if rsp is None:
             return t.uint8_t(tsn).serialize() + NOT_SUPPORTED.serialize()
@@ -152,7 +158,7 @@ class LocalZdo:
                     nwk=t.NWK(n.nwk),
                     device_type=zdo_t.Neighbor.DeviceType(min(n.device_type, 3)),
                     rx_on_when_idle=zdo_t.Neighbor.RxOnWhenIdle(min(n.rx_on, 2)),
-                    relationship=zdo_t.Neighbor.Relationship(min(n.relationship, 4)),
+                    relationship=zdo_t.Neighbor.Relationship(_RELATIONSHIP.get(n.relationship, 3)),
                     reserved1=0,
                     permit_joining=zdo_t.Neighbor.PermitJoins.Unknown,
                     reserved2=0,

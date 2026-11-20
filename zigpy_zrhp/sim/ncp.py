@@ -222,8 +222,19 @@ class SimNcp:
         transport_kind: int = 2,
         uart_baud: int = 921600,
         rng: random.Random | None = None,
+        legacy: bool = False,
+        response_budget: int | None = 896,
+        channel_change_delay: float = 0.05,
     ) -> None:
         self.rng = rng or random.Random(0x5EED)
+        # ``legacy``: behave like NCP images before ncp-host-gaps (no stored
+        # identity in NWK_GET_INFO state 1, restore only with the stack
+        # stopped, no capacity 19).
+        self.legacy = legacy
+        self.response_budget = None if legacy else response_budget
+        self.channel_change_delay = channel_change_delay
+        self.channel_change_pending = False
+        self.restores_while_up = 0
         self.factory_ieee = ieee
         self.ieee = ieee
         self.ieee_override = False
@@ -439,6 +450,11 @@ class SimNcp:
             (Capacity.GP_PROXY_TABLE, 8),
             (Capacity.MAX_NCP_REQUESTS, 8),
             (Capacity.MAX_TC_DEVICES, 256),
+            *(
+                [(Capacity.HOST_RESPONSE_BYTES, self.response_budget)]
+                if self.response_budget
+                else []
+            ),
         ]
         return self.ok(
             m.SysNegotiateRsp(
@@ -538,7 +554,7 @@ class SimNcp:
             for d in self.sim_devices.values()
         ]
         return self.ok(
-            m.DiagGetNeighborsRsp(total=len(entries), entries=entries[req.start : req.start + 8])
+            m.DiagGetNeighborsRsp(total=len(entries), entries=entries[req.start : req.start + 16])
         )
 
     def _h_diag_get_routes(self, req, msg):
@@ -598,8 +614,8 @@ class SimNcp:
 
     def _h_nwk_get_info(self, req, msg):
         n = self.net
-        if not self.running:
-            # Like the real NCP: the live NIB is only populated by NWK_INIT,
+        if not self.running and (self.legacy or not self.formed):
+            # Older NCP images: the live NIB is only populated by NWK_INIT,
             # so a formed-but-down network reads back as unconfigured.
             return self.ok(
                 m.NwkGetInfoRsp(
@@ -656,12 +672,16 @@ class SimNcp:
         return self.ok()
 
     def _h_nwk_group_membership(self, req, msg):
+        if not self.running:
+            raise _Reply(bytes([Status.INVALID_STATE]))
+        if not (1 <= req.ep <= 240 or req.ep == 242) or req.group > 0xFFF7:
+            raise _Reply(bytes([Status.INVALID_PARAMETER]))
         if req.op == 1:
             self.groups.add((req.group, req.ep))
         elif req.op == 2:
             self.groups.discard((req.group, req.ep))
         elif req.op == 3:
-            self.groups.clear()
+            self.groups = {g for g in self.groups if g[1] != req.ep}
         return self.ok()
 
     def _h_nwk_set_tx_power(self, req, msg):
@@ -680,14 +700,33 @@ class SimNcp:
         self.event(m.EvtEnergyScanResult(req_tid=msg.tid, status=0, results=results))
 
     def _h_nwk_change_channel(self, req, msg):
-        self._respond(Endpoint.ZIGBEE, msg, self.ok())
-        self.net.channel = req.channel
-        self.net.nwk_update_id = req.nwk_update_id or (self.net.nwk_update_id + 1) & 0xFF
-        self.event(
-            m.EvtChannelChanged(
-                channel=req.channel, nwk_update_id=self.net.nwk_update_id, req_tid=msg.tid
+        if not self.running:
+            raise _Reply(bytes([Status.INVALID_STATE]))
+        if not 11 <= req.channel <= 26:
+            raise _Reply(bytes([Status.INVALID_PARAMETER]))
+        if self.channel_change_pending:
+            raise _Reply(bytes([Status.BUSY]))
+        update_id = req.nwk_update_id or (self.net.nwk_update_id + 1) & 0xFF
+        if req.channel == self.net.channel:
+            self._respond(Endpoint.ZIGBEE, msg, self.ok())
+            self.event(
+                m.EvtChannelChanged(channel=req.channel, nwk_update_id=update_id, req_tid=msg.tid)
             )
-        )
+            return
+        # Committed to NV at once, the radio follows after the broadcast
+        # delivery time (9 s on the NCP, shortened here).
+        self.channel_change_pending = True
+        self.net.channel = req.channel
+        self.net.nwk_update_id = update_id
+        self._respond(Endpoint.ZIGBEE, msg, self.ok())
+
+        def tune() -> None:
+            self.channel_change_pending = False
+            self.event(
+                m.EvtChannelChanged(channel=req.channel, nwk_update_id=update_id, req_tid=msg.tid)
+            )
+
+        asyncio.get_running_loop().call_later(self.channel_change_delay, tune)
 
     def _h_nwk_remove_device(self, req, msg):
         self.devices.pop(req.ieee, None)
@@ -834,6 +873,12 @@ class SimNcp:
         return self.ok()
 
     def _h_sec_add_link_key(self, req, msg):
+        if not self.running:
+            raise _Reply(bytes([Status.INVALID_STATE]))
+        if req.key_type != 1 or req.rx_floor != 0:
+            raise _Reply(bytes([Status.UNSUPPORTED_COMMAND]))
+        if req.attrs > 2:
+            raise _Reply(bytes([Status.INVALID_PARAMETER]))
         dev = self.devices.setdefault(req.ieee, TcDevice(ieee=req.ieee))
         dev.key = req.key
         dev.origin = KeyOrigin.IMPORTED
@@ -843,8 +888,16 @@ class SimNcp:
     def _h_sec_add_install_code(self, req, msg):
         from ..crypto import install_code_key
 
+        if not self.running:
+            raise _Reply(bytes([Status.INVALID_STATE]))
         if len(req.code) not in (8, 10, 14, 18):
             raise _Reply(bytes([Status.INVALID_PARAMETER]))
+        import zigpy.util
+
+        try:
+            zigpy.util.convert_install_code(bytes(req.code))
+        except ValueError:  # CRC mismatch
+            raise _Reply(bytes([Status.INVALID_PARAMETER])) from None
         key = install_code_key(req.code)
         dev = self.devices.setdefault(req.ieee, TcDevice(ieee=req.ieee))
         dev.key = key
@@ -959,7 +1012,7 @@ class SimNcp:
     def _h_bkp_restore_begin(self, req, msg):
         if self.restore is not None:
             raise _Reply(bytes([Status.IN_PROGRESS]))
-        if self.running:
+        if self.running and self.legacy:
             raise _Reply(bytes([Status.INVALID_STATE]))
         self._txn += 1
         self.restore = {"txn": self._txn, "req": req, "records": []}
@@ -1036,6 +1089,12 @@ class SimNcp:
                 )
             elif isinstance(rec, GpSinkRecord):
                 gp[rec.gpd_id] = rec
+        if self.running:
+            # 9.4 rule 1: COMMIT wipes the running network like
+            # NWK_LEAVE_RESET; its outgoing counters are retained.
+            self.restores_while_up += 1
+            model.nwk_fc_start = max(model.nwk_fc_start, self.nwk_current, self.nwk_limit)
+            model.aps_fc_start = max(model.aps_fc_start, self.aps_current, self.aps_limit)
         self.net = net
         self.devices = devices
         self.gp_sink = gp

@@ -3,8 +3,8 @@
 The Rust process runs the real link layer, message dispatch, formation and
 backup code of the zigbee-rs NCP over stdin/stdout, with a mock radio. Set
 ``ZRHP_NCP_SIM`` to the binary (built with ``cargo build --manifest-path
-apps/ncp-coordinator/Cargo.toml --example ncp_sim`` on the ``zrhp-ncp-sim``
-branch of faronov/zigbee-rs); the tests are skipped otherwise.
+apps/ncp-coordinator/Cargo.toml --example ncp_sim``, faronov/zigbee-rs
+``ncp-host-gaps`` or newer); the tests are skipped otherwise.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import zigpy.types as t
 from zigpy_zrhp import messages as m
 from zigpy_zrhp.api import ZrhpApi
 from zigpy_zrhp.transport import ByteTransport
-from zigpy_zrhp.types import NcpCaps, Status
+from zigpy_zrhp.types import Capacity, NcpCaps, Status
 from zigpy_zrhp.zigbee.application import ControllerApplication
 
 from .app_bench import make_config
@@ -215,3 +215,67 @@ async def test_ncp_losing_its_network_is_not_resumed(tmp_path) -> None:
 async def _until(pred) -> None:
     while not pred():
         await asyncio.sleep(0.05)
+
+
+async def test_unbudgeted_echo_burst_loses_no_response() -> None:
+    """5.10: with the host budget lifted, the NCP holds credits or answers
+    BUSY instead of dropping responses; every request completes."""
+    holder: dict = {}
+    api = ZrhpApi(lambda: ProcessTransport(holder))
+    try:
+        session = await api.connect()
+        assert session.capacity(Capacity.HOST_RESPONSE_BYTES, 0) in (384, 896)
+        assert api.response_budget() == session.capacity(Capacity.HOST_RESPONSE_BYTES, 0)
+        api.response_budget = lambda: 1 << 16  # type: ignore[method-assign]
+        results = await asyncio.gather(
+            *(api.request(m.SysEchoReq(data=bytes([i]) * 64), timeout=20) for i in range(128))
+        )
+        assert all(r[1].data == bytes([i]) * 64 for i, r in enumerate(results))
+    finally:
+        await api.disconnect()
+        await kill(holder)
+
+
+INSTALL_CODE = bytes.fromhex("83FED3407A939723A5C639B26916D505C3B5")
+INSTALL_KEY = bytes.fromhex("66B6900981E1EE3CA4206B6B861C02BB")
+
+
+async def test_host_gap_commands(tmp_path) -> None:
+    """DIAG tables, keys, groups, restore while up and a channel change."""
+    holder: dict = {}
+    app = await _app(tmp_path, holder, auto_form=True)
+    try:
+        # Mgmt_Lqi / Mgmt_Rtg of the coordinator come from DIAG_GET_*.
+        status, neighbors = await app._device.zdo.Mgmt_Lqi_req(0)
+        assert status == 0 and neighbors.Entries == 0
+        status, routes = await app._device.zdo.Mgmt_Rtg_req(0)
+        assert status == 0
+        # Groups on a host endpoint and on the GP endpoint.
+        await app.api.request(m.NwkGroupMembershipReq(op=1, group=0x1234, ep=1))
+        await app.api.request(m.NwkGroupMembershipReq(op=1, group=0x0B84, ep=242))
+        await app.api.request(m.NwkGroupMembershipReq(op=2, group=0x1234, ep=1))
+        # Install code and TCLK provisioning, kept by the host.
+        dev = t.EUI64.convert("00:0d:6f:ff:fe:0a:90:69")
+        await app.permit_with_key(dev, INSTALL_CODE, time_s=5)
+        row = await app._store.get_link_key(dev.serialize())
+        assert row.key == INSTALL_KEY
+        with pytest.raises(ValueError):
+            await app.permit_with_key(dev, INSTALL_CODE[:-1] + b"\x00", time_s=5)
+        dev2 = t.EUI64.convert("00:0d:6f:ff:fe:0a:90:6a")
+        await app.permit_with_link_key(dev2, t.KeyData(bytes(range(16))), time_s=5)
+        # Restore while the network is up (9.4 rule 1): COMMIT replaces it.
+        backup = await app.backups.create_backup(load_devices=True)
+        await app.backups.restore_backup(backup)
+        await app.initialize()
+        info = await app._get_info()
+        assert info.state == 2 and info.pan_id == backup.network_info.pan_id
+        # Channel change: the event follows after the broadcast delivery time.
+        old = app.state.network_info
+        new_channel = 20 if old.channel != 20 else 25
+        await app._move_network_to_channel(new_channel, (old.nwk_update_id + 1) & 0xFF)
+        assert app.state.network_info.channel == new_channel
+        info = await app._get_info()
+        assert info.channel == new_channel
+    finally:
+        await app.shutdown()
+        await kill(holder)
