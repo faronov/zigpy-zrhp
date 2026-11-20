@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zigpy-zrhp"
+dynamic = ["version"]
+description = "zigpy radio library for zigbee-rs NCPs speaking ZRHP (zigbee-rs Host Protocol)"
+readme = "README.md"
+license = {text = "GPL-3.0"}
+authors = [{name = "faronov", email = "faronov@gmail.com"}]
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Topic :: Home Automation",
+]
+dependencies = [
+    "zigpy>=2.4.1",
+    "voluptuous",
+    "cryptography",
+]
+
+[project.optional-dependencies]
+# zigpy with the Green Power "sink on radio" hook (faronov/zigpy, branch zrhp-hooks).
+# Without it the library swallows zigpy's own GP sink transmissions instead.
+gp-hook = ["zigpy @ git+https://github.com/faronov/zigpy@zrhp-hooks"]
+testing = [
+    "pytest>=8",
+    "pytest-asyncio>=1.3.0",
+    "pytest-timeout",
+    "ruff==0.14.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/faronov/zigpy-zrhp"
+Specification = "https://github.com/faronov/zigbee-rs/blob/master/docs/book/src/advanced/host-protocol.md"
+
+[project.scripts]
+zigpy-zrhp = "zigpy_zrhp.tools.cli:main"
+
+[project.entry-points."zigpy.radio"]
+zrhp = "zigpy_zrhp.zigbee.application:ControllerApplication"
+
+[tool.setuptools.dynamic]
+version = {attr = "zigpy_zrhp.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["zigpy_zrhp*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+timeout = 120
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF100"]
+ignore = ["E501", "B008", "ASYNC109", "ASYNC110", "UP040"]
+
+[tool.ruff.lint.per-file-ignores]
+"zigpy_zrhp/tools/cli.py" = ["ASYNC230"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["zigpy_zrhp", "tests"]
+combine-as-imports = true

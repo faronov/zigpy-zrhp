@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: nightly-2026-03-23
+  ZIGBEE_RS_REF: zrhp-ncp-sim
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff==0.14.14"
+      - run: ruff check zigpy_zrhp tests scripts
+      - run: ruff format --check zigpy_zrhp tests scripts
+
+  vectors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/sync_vectors.py --check
+
+  test:
+    name: test (Python ${{ matrix.python }}, ${{ matrix.zigpy }} zigpy)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        zigpy: [stock, fork]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[testing]"
+      - if: matrix.zigpy == 'fork'
+        # The faronov/zigpy "sink on radio" hook (optional dependency gp-hook)
+        run: pip install "zigpy @ git+https://github.com/faronov/zigpy@zrhp-hooks"
+      - run: python -c "import zigpy, zigpy_zrhp.gp as g; print(zigpy.__file__, 'hook' if g.zigpy_has_radio_sink_hook() else 'no hook')"
+      - run: python -m pytest -q tests
+
+  rust-ncp:
+    name: test against the Rust NCP (ncp_sim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: faronov/zigbee-rs
+          ref: ${{ env.ZIGBEE_RS_REF }}
+          path: zigbee-rs
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zigbee-rs/apps/ncp-coordinator
+      - run: cargo build --manifest-path zigbee-rs/apps/ncp-coordinator/Cargo.toml --example ncp_sim --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[testing]"
+      - name: Run (the Rust tests must not be skipped)
+        run: |
+          python -m pytest -q tests/test_rust_ncp.py -rs 2>&1 | tee out.txt
+          test "${PIPESTATUS[0]}" -eq 0
+          ! grep -q skipped out.txt
+        env:
+          ZRHP_NCP_SIM: ${{ github.workspace }}/zigbee-rs/apps/ncp-coordinator/target/debug/examples/ncp_sim
