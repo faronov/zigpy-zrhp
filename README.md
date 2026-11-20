@@ -73,6 +73,8 @@ zigpy-zrhp -p PORT permit 60 --ncp-only --listen
 zigpy-zrhp -p PORT listen --seconds 60 --log-level 3
 zigpy-zrhp -p PORT reset [--mode reboot|bootloader|factory] [--hard]
 zigpy-zrhp sim        # a simulated NCP on a pseudo-terminal
+zigpy-zrhp -p PORT app --pan-id 0x1C06 --channel 17 --form --permit 120 --run 300
+                      # zigpy itself on the NCP (no Home Assistant), printing joins
 ```
 
 ## Development

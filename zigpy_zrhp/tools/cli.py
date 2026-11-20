@@ -322,6 +322,83 @@ async def cmd_gp(api: ZrhpApi, args) -> None:
             break
 
 
+def run_app(args) -> None:
+    """Run a zigpy ControllerApplication on the NCP (no Home Assistant)."""
+    import pathlib
+
+    import zigpy.config as zconf
+
+    from ..zigbee.application import ControllerApplication
+
+    db = pathlib.Path(args.database).expanduser()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    nwk: dict[str, Any] = {}
+    if args.pan_id is not None:
+        nwk[zconf.CONF_NWK_PAN_ID] = args.pan_id
+    if args.channel is not None:
+        nwk[zconf.CONF_NWK_CHANNEL] = args.channel
+        nwk[zconf.CONF_NWK_CHANNELS] = [args.channel]
+    config = {
+        zconf.CONF_DEVICE: {
+            zconf.CONF_DEVICE_PATH: args.port,
+            zconf.CONF_DEVICE_BAUDRATE: args.baudrate,
+            zconf.CONF_DEVICE_FLOW_CONTROL: None
+            if args.flow_control == "none"
+            else args.flow_control,
+        },
+        zconf.CONF_DATABASE: str(db),
+        zconf.CONF_NWK: nwk,
+        zconf.CONF_OTA: {zconf.CONF_OTA_ENABLED: False},
+        zconf.CONF_TOPO_SCAN_ENABLED: False,
+    }
+
+    class Listener:
+        def device_joined(self, device) -> None:
+            print(f"JOINED   {device.ieee} nwk=0x{device.nwk:04X}", flush=True)
+
+        def device_initialized(self, device) -> None:
+            print(f"READY    {device.ieee} {device.manufacturer!r} {device.model!r}", flush=True)
+
+        def device_left(self, device) -> None:
+            print(f"LEFT     {device.ieee}", flush=True)
+
+        def handle_message(self, device, profile, cluster, src_ep, dst_ep, message) -> None:
+            print(f"RX       {device.ieee} ep{src_ep} 0x{cluster:04X} {message.hex()}", flush=True)
+
+        def connection_lost(self, exc) -> None:
+            print(f"LOST     {exc!r}", flush=True)
+
+    async def main() -> None:
+        app = await ControllerApplication.new(config, auto_form=args.form)
+        app.add_listener(Listener())
+        ni, node = app.state.network_info, app.state.node_info
+        print(
+            f"NETWORK  pan=0x{ni.pan_id:04X} channel={ni.channel} epid={ni.extended_pan_id} "
+            f"ieee={node.ieee} devices={len(app.devices) - 1}",
+            flush=True,
+        )
+        try:
+            if args.permit:
+                if args.ncp_only:
+                    await app.permit_ncp(args.permit)
+                else:
+                    await app.permit(args.permit)
+                print(f"PERMIT   {args.permit}s", flush=True)
+            if args.backup:
+                backup = await app.backups.create_backup(load_devices=True)
+                with open(args.backup, "w") as f:
+                    json.dump(backup.as_open_coordinator_json(), f, indent=2)
+                print(f"BACKUP   {args.backup} complete={backup.is_complete()}", flush=True)
+            await asyncio.sleep(args.run)
+        finally:
+            await app.shutdown()
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+
 def run_sim(args) -> None:
     """A simulated NCP on a pseudo-terminal (for zigpy/HA development)."""
     import tty
@@ -410,6 +487,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("lock-key-export")
     sub.add_parser("gp-sink-table")
     sub.add_parser("sim")
+    a = sub.add_parser("app", help="run zigpy on the NCP (no Home Assistant)")
+    a.add_argument("--database", default="~/.zigpy-zrhp/zigbee.db")
+    a.add_argument("--pan-id", type=lambda s: int(s, 0), default=None)
+    a.add_argument("--channel", type=int, default=None)
+    a.add_argument("--form", action="store_true", help="form a network if the NCP has none")
+    a.add_argument("--permit", type=int, default=0)
+    a.add_argument("--ncp-only", action="store_true", help="permit joins on the NCP only")
+    a.add_argument("--backup", default=None, help="write a backup (OCB JSON) to this file")
+    a.add_argument("--run", type=float, default=60, help="seconds to keep running")
     return p
 
 
@@ -424,6 +510,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if not args.port:
         raise SystemExit("--port (or ZRHP_PORT) is required")
+    if args.cmd == "app":
+        run_app(args)
+        return
     if args.cmd == "form" and args.channel is None:
         args.channel = [11, 15, 20, 25]
     handlers = {
