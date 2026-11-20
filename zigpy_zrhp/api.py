@@ -39,6 +39,7 @@ LOGGER = logging.getLogger(__name__)
 
 MAJOR = 1
 DEFAULT_TIMEOUT = 5.0
+HARD_RESET_BOOT_S = 2.0  # NCP boot time after a DTR/RTS reset
 HOST_CAPS = (
     HostCaps.HOST_TABLES | HostCaps.FC_CHECKPOINTS | HostCaps.RETRY_CACHE | HostCaps.GP_SHADOW
 )
@@ -218,8 +219,17 @@ class ZrhpApi:
     def is_ready(self) -> bool:
         return self._ready.is_set()
 
-    async def connect(self) -> SessionInfo:
-        """Open the port and complete handshake + negotiation; side-effect free on failure."""
+    #: valid frames received during the last failed handshake (0: wrong baud or silent NCP)
+    handshake_rx_frames: int = 0
+
+    async def connect(self, *, reset_on_failure: bool = False) -> SessionInfo:
+        """Open the port and complete handshake + negotiation.
+
+        With ``reset_on_failure`` a silent NCP (no session within the handshake
+        timeout, e.g. left in the ROM bootloader by an earlier DTR/RTS sequence)
+        gets one DTR/RTS hard reset and a second handshake on the same port.
+        Without it the call is side-effect free on failure.
+        """
         self._closing = False
         transport = self._transport_factory()
         transport.on_lost = self._on_port_lost
@@ -230,12 +240,36 @@ class ZrhpApi:
                 transport, self._link_config, self._cookie_factory(), self._on_link_event
             )
             self.driver.start(ResetReason.HOST_OPEN)
-            await self.wait_ready(self._handshake_timeout)
+            try:
+                await self.wait_ready(self._handshake_timeout)
+            except SessionLost as e:
+                diag = self._handshake_diag()
+                if not reset_on_failure:
+                    raise SessionLost(f"{e} ({diag})") from None
+                LOGGER.warning("No ZRHP session (%s); trying a DTR/RTS hard reset", diag)
+                await transport.hard_reset()
+                self.driver.restart(self._cookie_factory(), ResetReason.HOST_OPEN)
+                try:
+                    await self.wait_ready(self._handshake_timeout + HARD_RESET_BOOT_S)
+                except SessionLost as e2:
+                    raise SessionLost(
+                        f"{e2} after a hard reset ({self._handshake_diag()})"
+                    ) from None
         except BaseException:
             await self.disconnect()
             raise
         assert self.session is not None
         return self.session
+
+    def _handshake_diag(self) -> str:
+        if self.driver is None:
+            return "no link"
+        c = self.driver.link.counters
+        self.handshake_rx_frames = c.rx_frames
+        return (
+            f"rx {c.rx_bytes} B, {c.rx_frames} frames, {c.rx_bad_frame} bad, "
+            f"{c.rx_stale_reset} stale resets, {c.rx_not_in_session} out of session"
+        )
 
     async def disconnect(self) -> None:
         self._closing = True

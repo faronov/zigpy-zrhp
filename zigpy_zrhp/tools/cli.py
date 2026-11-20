@@ -388,7 +388,14 @@ def run_app(args) -> None:
             print(f"LOST     {exc!r}", flush=True)
 
     async def main() -> None:
-        app = await ControllerApplication.new(config, auto_form=args.form)
+        app = ControllerApplication(config)
+        await app._load_db()
+        try:
+            await app.startup(auto_form=args.form)
+        except BaseException:
+            # zigpy leaves its database thread running after a failed startup
+            await app.shutdown(db=True)
+            raise
         app.add_listener(Listener())
         ni, node = app.state.network_info, app.state.node_info
         print(
@@ -408,6 +415,21 @@ def run_app(args) -> None:
                 with open(args.backup, "w") as f:
                     json.dump(backup.as_open_coordinator_json(), f, indent=2)
                 print(f"BACKUP   {args.backup} complete={backup.is_complete()}", flush=True)
+            if args.reboot_after is not None:
+                await asyncio.sleep(args.reboot_after)
+                lost = []
+                app.connection_lost = lambda exc: lost.append(exc)  # type: ignore[method-assign]
+                await app._api.request(m.SysResetReq(mode=0, confirm=0))
+                print("REBOOT   SYS_RESET reboot accepted; expecting a seamless resume", flush=True)
+                t0 = time.monotonic()
+                for _ in range(50):  # wait for the reboot to be noticed
+                    await asyncio.sleep(0.1)
+                    if not app._resumed.is_set():
+                        break
+                await asyncio.wait_for(app._resumed.wait(), 20)
+                print(f"         resumed after {time.monotonic() - t0:.2f}s", flush=True)
+                print(f"RESUMED  connection_lost={lost or None}", flush=True)
+                args.run = max(0.0, args.run - args.reboot_after)
             await asyncio.sleep(args.run)
         finally:
             await app.shutdown()
@@ -520,6 +542,12 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--ncp-only", action="store_true", help="permit joins on the NCP only")
     a.add_argument("--backup", default=None, help="write a backup (OCB JSON) to this file")
     a.add_argument("--run", type=float, default=60, help="seconds to keep running")
+    a.add_argument(
+        "--reboot-after",
+        type=float,
+        default=None,
+        help="reboot the NCP (SYS_RESET) after N seconds",
+    )
     return p
 
 

@@ -194,3 +194,18 @@ async def test_no_ieee_change_without_capability(tmp_path) -> None:
     finally:
         await app2.shutdown()
         await sim.stop()
+
+
+async def test_concurrent_backups_are_serialized(tmp_path) -> None:
+    """The NCP keeps one export transaction; zigpy's periodic backup may overlap."""
+    import asyncio
+
+    app, bench = await start_app(tmp_path)
+    try:
+        a, b = await asyncio.gather(
+            app.backups.create_backup(load_devices=True),
+            app.backups.create_backup(load_devices=True),
+        )
+        assert a.is_complete() and b.is_complete()
+    finally:
+        await stop(app, bench)

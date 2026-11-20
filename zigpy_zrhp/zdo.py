@@ -15,6 +15,7 @@ import zigpy.types as t
 import zigpy.zdo.types as zdo_t
 
 from . import messages as m
+from .types import Status
 
 if TYPE_CHECKING:
     from .zigbee.application import ControllerApplication
@@ -131,8 +132,16 @@ class LocalZdo:
     async def _IEEE_addr_req(self, tsn, nwk, *rest):
         return await self._addr_rsp(zdo_t.ZDOCmd.IEEE_addr_rsp, tsn)
 
+    async def _diag(self, req):
+        status, rsp = await self.app._api.request(
+            req, allow=(Status.SUCCESS, Status.UNSUPPORTED_COMMAND)
+        )
+        return rsp if status == Status.SUCCESS else None
+
     async def _Mgmt_Lqi_req(self, tsn, start):
-        _, rsp = await self.app._api.request(m.DiagGetNeighborsReq(start=start))
+        rsp = await self._diag(m.DiagGetNeighborsReq(start=start))
+        if rsp is None:
+            return t.uint8_t(tsn).serialize() + NOT_SUPPORTED.serialize()
         epid = self.app.state.network_info.extended_pan_id
         entries = []
         for n in rsp.entries:
@@ -155,7 +164,9 @@ class LocalZdo:
         return _rsp(zdo_t.ZDOCmd.Mgmt_Lqi_rsp, tsn, zdo_t.Status.SUCCESS, neighbors)
 
     async def _Mgmt_Rtg_req(self, tsn, start):
-        _, rsp = await self.app._api.request(m.DiagGetRoutesReq(start=start))
+        rsp = await self._diag(m.DiagGetRoutesReq(start=start))
+        if rsp is None:
+            return t.uint8_t(tsn).serialize() + NOT_SUPPORTED.serialize()
         routes = [
             zdo_t.Route(
                 DstNWK=t.NWK(r.dst),

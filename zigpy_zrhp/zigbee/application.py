@@ -132,6 +132,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._last_counters = 0.0
         self._confirms: dict[int, asyncio.Future] = {}
         self._network_waiters: list[asyncio.Future] = []
+        # The NCP holds one export transaction (a new BEGIN replaces it) and
+        # one restore at a time.
+        self._backup_lock = asyncio.Lock()
         self._scan_waiters: dict[int, asyncio.Future] = {}
         self.manufacturer_code = zc[CONF_MANUFACTURER_CODE] or 0x0000
         self._baudrate = self._config[zigpy.config.CONF_DEVICE][CONF_DEVICE_BAUDRATE]
@@ -171,17 +174,23 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             await store.open()
         last_exc: Exception | None = None
         try:
-            for baudrate, flow in attempts:
+            for i, (baudrate, flow) in enumerate(attempts):
                 api = ZrhpApi(
                     lambda b=baudrate, f=flow: self._create_transport(b, f),
                     name=f"zigpy-zrhp/{__version__}",
                     handshake_timeout=zc[CONF_CONNECT_TIMEOUT],
                 )
                 try:
-                    await api.connect()
+                    # Only the configured rate earns a hard reset: a silent NCP
+                    # there is more likely stuck than running at another rate.
+                    await api.connect(reset_on_failure=(i == 0))
                 except (SessionLost, OSError, ZrhpError) as e:
                     last_exc = e
                     LOGGER.debug("No ZRHP session at %s baud: %r", baudrate, e)
+                    if api.handshake_rx_frames:
+                        # Valid frames at this rate: the baud rate is right, the
+                        # NCP just did not complete the handshake.
+                        raise
                     continue
                 self._baudrate, self._flow = baudrate, flow
                 break
@@ -513,6 +522,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     # --- Network info / backups -------------------------------------------------
 
     async def _export(self, *, keys: bool, devices: bool, gp: bool) -> list[Any]:
+        async with self._backup_lock:
+            return await self._export_locked(keys=keys, devices=devices, gp=gp)
+
+    async def _export_locked(self, *, keys: bool, devices: bool, gp: bool) -> list[Any]:
         flags = (0x01 if keys else 0) | (0x02 if devices else 0) | (0x04 if gp else 0)
         _, begin = await self.api.request(m.BkpExportBeginReq(flags=flags))
         stream = bytearray()
@@ -1129,6 +1142,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         epoch = await self._store.meta("table_epoch")
         if epoch is not None and ready.table_epoch != epoch:
             raise SessionLost(f"NCP table epoch changed ({epoch} -> {ready.table_epoch})")
+        if ready.network_state != NetworkState.UP:
+            # The NCP only reports the network parameters once NWK_INIT has
+            # brought the persisted network up (formed-down reads back as an
+            # unconfigured NIB), so start it before comparing.
+            await self._bring_up()
         net = await self._get_info()
         ni = self.state.network_info
         node = self.state.node_info
@@ -1160,8 +1178,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 network_key=ni.network_key.replace(seq=net.key_seq),
             )
         _, self._info = await self.api.request(m.SysGetInfoReq())
-        if net.state != NetworkState.UP:
-            await self._bring_up()
         await self._apply_tc_policy()
         for desc in list(self.host_endpoints.values()):
             await self.add_endpoint(desc)

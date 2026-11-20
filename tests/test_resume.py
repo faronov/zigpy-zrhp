@@ -8,9 +8,9 @@ import zigpy.exceptions
 import zigpy.types as t
 
 from zigpy_zrhp import messages as m
-from zigpy_zrhp.sim.ncp import SWALLOW, SimDevice
+from zigpy_zrhp.sim.ncp import SWALLOW, SimDevice, SimNcp
 
-from .app_bench import start_app, stop, wait_for
+from .app_bench import Bench, start_app, stop, wait_for
 
 DEV = bytes.fromhex("0c0b0afeff142e84")
 
@@ -162,5 +162,32 @@ async def test_ncp_never_returns_gives_up_after_hard_reset(tmp_path) -> None:
         # The DTR/RTS reset sequence (0,0) -> (RTS=1, DTR=0) -> (0,0) was tried once.
         assert (False, True) in lines
         assert lines.index((False, True)) > lines.index((False, False))
+    finally:
+        await stop(app, bench)
+
+
+async def test_silent_ncp_at_startup_gets_one_hard_reset(tmp_path) -> None:
+    """An NCP left in its ROM bootloader answers nothing until EN is pulsed."""
+    lines: list[tuple[bool, bool]] = []
+
+    class StuckBench(Bench):
+        def transport(self):
+            host_end = super().transport()
+            ncp_end = self.ncp_end
+            ncp_end.is_open = False  # silent
+
+            def on_lines(dtr: bool, rts: bool) -> None:
+                lines.append((dtr, rts))
+                if (dtr, rts) == (False, False) and (False, True) in lines:
+                    ncp_end.is_open = True  # EN released: the firmware boots
+
+            host_end.on_lines = on_lines
+            return host_end
+
+    app, bench = await start_app(tmp_path, StuckBench(SimNcp()), connect_timeout=1.0)
+    try:
+        assert lines.count((False, True)) == 1
+        assert app._baudrate == 921600  # no baud fallback for a stuck NCP
+        assert app.state.network_info.pan_id == bench.sim.net.pan_id
     finally:
         await stop(app, bench)

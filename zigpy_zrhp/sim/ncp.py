@@ -598,6 +598,26 @@ class SimNcp:
 
     def _h_nwk_get_info(self, req, msg):
         n = self.net
+        if not self.running:
+            # Like the real NCP: the live NIB is only populated by NWK_INIT,
+            # so a formed-but-down network reads back as unconfigured.
+            return self.ok(
+                m.NwkGetInfoRsp(
+                    state=self.network_state,
+                    pan_id=0xFFFF,
+                    ext_pan_id=bytes(8),
+                    channel=0,
+                    channel_mask=n.channel_mask,
+                    short=0xFFFF,
+                    ieee=self.ieee,
+                    nwk_update_id=0,
+                    nwk_manager=0,
+                    key_seq=0,
+                    security_level=5,
+                    tx_power=n.tx_power,
+                    stack_profile=2,
+                )
+            )
         return self.ok(
             m.NwkGetInfoRsp(
                 state=self.network_state,
