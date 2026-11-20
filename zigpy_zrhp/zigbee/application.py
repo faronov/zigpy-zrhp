@@ -162,7 +162,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def connect(self) -> None:
         zc = self._zrhp_config
-        attempts = [(self._baudrate, self._flow)]
+        # The configured rate twice: a fresh open revives a link that stayed
+        # silent for a whole handshake (seen behind the ESP32-S3 USB bridge),
+        # and only then a hard reset and the fallback rate.
+        attempts = [(self._baudrate, self._flow), (self._baudrate, self._flow)]
         if zc[CONF_BAUDRATE_FALLBACK] and (self._baudrate, self._flow) != (FALLBACK_BAUDRATE, None):
             attempts.append((FALLBACK_BAUDRATE, None))
         store = self._store
@@ -181,12 +184,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     handshake_timeout=zc[CONF_CONNECT_TIMEOUT],
                 )
                 try:
-                    # Only the configured rate earns a hard reset: a silent NCP
-                    # there is more likely stuck than running at another rate.
-                    await api.connect(reset_on_failure=(i == 0))
+                    # Only the reopened configured rate earns a hard reset: a
+                    # silent NCP there is more likely stuck than at another rate.
+                    await api.connect(reset_on_failure=(i == 1))
                 except (SessionLost, OSError, ZrhpError) as e:
                     last_exc = e
-                    LOGGER.debug("No ZRHP session at %s baud: %r", baudrate, e)
+                    LOGGER.warning("No ZRHP session at %s baud: %s", baudrate, e)
                     if api.handshake_rx_frames:
                         # Valid frames at this rate: the baud rate is right, the
                         # NCP just did not complete the handshake.

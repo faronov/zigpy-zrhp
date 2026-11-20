@@ -191,3 +191,28 @@ async def test_silent_ncp_at_startup_gets_one_hard_reset(tmp_path) -> None:
         assert app.state.network_info.pan_id == bench.sim.net.pan_id
     finally:
         await stop(app, bench)
+
+
+async def test_silent_first_open_is_revived_by_reopening(tmp_path) -> None:
+    """A link silent for one whole open recovers on the next open, no reset."""
+    lines: list[tuple[bool, bool]] = []
+
+    class OnceSilentBench(Bench):
+        opens = 0
+
+        def transport(self):
+            host_end = super().transport()
+            self.opens += 1
+            if self.opens == 1:
+                self.ncp_end.is_open = False
+            host_end.on_lines = lambda dtr, rts: lines.append((dtr, rts))
+            return host_end
+
+    bench = OnceSilentBench(SimNcp())
+    app, bench = await start_app(tmp_path, bench, connect_timeout=1.0)
+    try:
+        assert bench.opens == 2
+        assert (False, True) not in lines  # no EN pulse
+        assert app._baudrate == 921600
+    finally:
+        await stop(app, bench)
